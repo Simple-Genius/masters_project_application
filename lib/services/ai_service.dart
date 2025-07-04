@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:isolate';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:llama_sdk/llama_sdk.dart';
@@ -8,6 +7,7 @@ import 'package:llama_sdk/llama_sdk.dart';
 class AiService {
   bool _isInitialized = false;
   String? _modelPath;
+  static int _conversationCount = 0;
 
   Future<bool> loadModel() async {
     try {
@@ -56,191 +56,92 @@ class AiService {
     }
   }
 
-  Future<void> talkAsync({
-    required String prompt,
-    required Function(String) onTokenGenerated,
-  }) async {
+  Future<String> generateTextComplete(String prompt) async {
     if (!_isInitialized || _modelPath == null) {
-      onTokenGenerated(
-        'Error: Model not loaded. Please wait for initialization.',
-      );
-      return;
+      return 'Error: Model not loaded. Please wait for initialization.';
     }
 
+    _conversationCount++;
+    debugPrint('=== Starting conversation #$_conversationCount ===');
+
     try {
-      debugPrint('Starting AI conversation for: $prompt');
-
-      final receivePort = ReceivePort();
-
-      // Start isolate for text generation
-      await Isolate.spawn(
-        _aiIsolateEntryPoint,
-        _IsolateData(
-          modelPath: _modelPath!,
-          prompt: prompt,
-          sendPort: receivePort.sendPort,
-        ),
-      );
-
-      await for (final message in receivePort) {
-        if (message is String) {
-          if (message == '_DONE_') {
-            receivePort.close();
-            break;
-          } else if (message.startsWith('_ERROR_')) {
-            onTokenGenerated('Error: ${message.substring(7)}');
-            receivePort.close();
-            break;
-          } else {
-            onTokenGenerated(message);
-          }
-        }
-      }
-
-      debugPrint('AI conversation completed');
-    } catch (e) {
-      debugPrint('Error in AI conversation: $e');
-      onTokenGenerated('Sorry, I encountered an error. Please try again.');
-    }
-  }
-
-  static void _aiIsolateEntryPoint(_IsolateData data) async {
-    try {
-      // Create model instance with improved parameters
+      // Create a fresh model instance for each request
+      debugPrint('Creating new model instance...');
       final model = Llama(
         LlamaController(
-          modelPath: data.modelPath,
-          nCtx: 2048, // Increased context size for Llama 3.2
-          nBatch: 512, // Increased batch size
-          nThreads: 4, // Add thread count
-          temperature: 0.8, // Slightly higher temperature
-          topP: 0.95, // Slightly higher topP
-          topK: 40, // Add topK parameter
-          penaltiesRepeat: 1.1, // Add repeat penalty to avoid repetition
-          seed: -1, // Random seed
+          modelPath: _modelPath!,
+          nCtx: 512, // Even smaller context
+          nBatch: 128, // Smaller batch
+          nThreads: 1, // Single thread for stability
+          temperature: 0.7,
+          topP: 0.9,
+          topK: 40,
+          penaltiesRepeat: 1.1,
+          seed:
+              DateTime.now().millisecondsSinceEpoch, // Different seed each time
         ),
       );
 
-      // Format the prompt properly for Llama 3.2 Instruct
-      final formattedPrompt =
-          '''<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+      debugPrint('Model instance created');
 
-You are a helpful AI assistant. Keep your responses concise and friendly.<|eot_id|><|start_header_id|>user<|end_header_id|>
+      final messages = [LlamaMessage.withRole(role: 'user', content: prompt)];
 
-${data.prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
-''';
-
-      final messages = [
-        LlamaMessage.withRole(
-          role: 'system',
-          content:
-              'You are a helpful AI assistant. Keep your responses concise and friendly.',
-        ),
-        LlamaMessage.withRole(role: 'user', content: data.prompt),
-      ];
-
+      final buffer = StringBuffer();
       var tokenCount = 0;
-      var fullResponse = '';
-      var buffer = '';
+      const maxTokens = 80; // Strict limit
 
-      // Track end-of-text markers
-      const endMarkers = ['<|eot_id|>', '<|end_of_text|>', '</s>'];
+      debugPrint('Starting generation...');
 
       await for (final token in model.prompt(messages)) {
-        // Check for end markers
-        buffer += token;
-
-        // Check if we've hit an end marker
-        bool shouldStop = false;
-        for (final marker in endMarkers) {
-          if (buffer.contains(marker)) {
-            // Remove the marker from the output
-            fullResponse = fullResponse.replaceAll(marker, '');
-            shouldStop = true;
-            break;
-          }
-        }
-
-        if (shouldStop) {
-          break;
-        }
-
         // Skip empty tokens
-        if (token.isEmpty || token == ' ' && fullResponse.isEmpty) {
+        if (token.isEmpty || token.trim().isEmpty) {
           continue;
         }
 
-        fullResponse += token;
-        data.sendPort.send(token);
-        tokenCount++;
-
-        // More generous token limit
-        if (tokenCount > 256) {
+        // Skip end markers
+        if (token.contains('<|') || token.contains('|>')) {
+          debugPrint('Found end marker, stopping');
           break;
         }
 
-        // Natural stopping points after sufficient content
-        if (tokenCount > 30) {
-          final trimmed = fullResponse.trim();
-          if (trimmed.endsWith('.') ||
-              trimmed.endsWith('!') ||
-              trimmed.endsWith('?') ||
-              trimmed.endsWith(':')) {
-            // Check if next few tokens would start a new sentence
-            await Future.delayed(Duration(milliseconds: 50));
-            break;
-          }
+        buffer.write(token);
+        tokenCount++;
+
+        if (tokenCount % 10 == 0) {
+          debugPrint('Generated $tokenCount tokens...');
+        }
+
+        // Hard stop at max tokens
+        if (tokenCount >= maxTokens) {
+          debugPrint('Reached max tokens limit');
+          break;
+        }
+
+        // Natural stopping point
+        final current = buffer.toString();
+        if (tokenCount > 20 &&
+            (current.endsWith('.') ||
+                current.endsWith('!') ||
+                current.endsWith('?'))) {
+          debugPrint('Found natural stopping point');
+          break;
         }
       }
 
-      // Clean up the response
-      fullResponse = fullResponse.trim();
-
-      data.sendPort.send('_DONE_');
-    } catch (e) {
-      debugPrint('Error in isolate: $e');
-      data.sendPort.send('_ERROR_$e');
-    }
-  }
-
-  Future<String> generateTextComplete(String prompt) async {
-    final completer = Completer<String>();
-    final buffer = StringBuffer();
-
-    // Add timeout to prevent hanging
-    final timer = Timer(Duration(seconds: 30), () {
-      if (!completer.isCompleted) {
-        completer.complete(
-          'Sorry, the response took too long. Please try again.',
-        );
-      }
-    });
-
-    await talkAsync(
-      prompt: prompt,
-      onTokenGenerated: (token) {
-        if (token.startsWith('Error:')) {
-          timer.cancel();
-          if (!completer.isCompleted) {
-            completer.complete(token);
-          }
-        } else {
-          buffer.write(token);
-        }
-      },
-    );
-
-    timer.cancel();
-
-    if (!completer.isCompleted) {
       final response = buffer.toString().trim();
-      completer.complete(
-        response.isEmpty ? 'I need more time to think about that.' : response,
-      );
-    }
+      debugPrint('Generation complete: $tokenCount tokens');
+      debugPrint('Response: $response');
 
-    return completer.future;
+      // No need to explicitly dispose - let garbage collection handle it
+
+      return response.isEmpty
+          ? 'I need more time to think about that.'
+          : response;
+    } catch (e, stackTrace) {
+      debugPrint('Error in text generation: $e');
+      debugPrint('Stack trace: $stackTrace');
+      return 'Sorry, I encountered an error. Please try again.';
+    }
   }
 
   bool get isModelLoaded => _isInitialized && _modelPath != null;
@@ -254,16 +155,4 @@ ${data.prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
       debugPrint('Error disposing AI service: $e');
     }
   }
-}
-
-class _IsolateData {
-  final String modelPath;
-  final String prompt;
-  final SendPort sendPort;
-
-  _IsolateData({
-    required this.modelPath,
-    required this.prompt,
-    required this.sendPort,
-  });
 }
